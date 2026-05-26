@@ -1,4 +1,4 @@
-﻿# NetScanner Pro - GitHub Push Script
+# NetScanner Pro - GitHub Push Script (Incremental Update)
 # Run: powershell -ExecutionPolicy Bypass -File push-to-github.ps1
 
 $githubUser = "litontechtw-star"
@@ -15,90 +15,69 @@ Write-Host "GitHub  : $githubUser/$repoName" -ForegroundColor Green
 Write-Host ""
 
 # STEP 1: Get Token
-Write-Host "--- STEP 1: Personal Access Token ---" -ForegroundColor Yellow
+Write-Host "--- Personal Access Token ---" -ForegroundColor Yellow
 Write-Host "Get token from: https://github.com/settings/tokens/new" -ForegroundColor Green
-Write-Host "  - Note: NetScanner"
-Write-Host "  - Expiration: 30 days"
-Write-Host "  - Check 'repo' scope"
-Write-Host "  - Click Generate token, copy ghp_..."
+Write-Host "  - Check 'repo' AND 'workflow' scopes"
 Write-Host ""
 $token = Read-Host "Paste your token (ghp_...)"
 
 if ([string]::IsNullOrWhiteSpace($token)) {
-    Write-Host "Token cannot be empty. Please re-run the script." -ForegroundColor Red
+    Write-Host "Token cannot be empty." -ForegroundColor Red
     Read-Host "Press Enter to exit"
     exit 1
 }
 
-# STEP 2: Confirm repo exists
-Write-Host ""
-Write-Host "--- STEP 2: Confirm GitHub Repository ---" -ForegroundColor Yellow
-Write-Host "Go to: https://github.com/new" -ForegroundColor Green
-Write-Host "  - Repository name: NetScanner"
-Write-Host "  - Do NOT check any init options (README, .gitignore)"
-Write-Host ""
-Read-Host "Press Enter after repo is created..."
-
-# STEP 3: Setup git
-Write-Host ""
-Write-Host "[1/5] Initializing Git..." -ForegroundColor Cyan
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $scriptDir
-
-if (Test-Path ".git") {
-    Remove-Item -Recurse -Force ".git" -ErrorAction SilentlyContinue
-}
-
-& git init
-& git config user.email $gitEmail
-& git config user.name $gitName
-
-$branch = & git branch --show-current 2>$null
-if ($branch -ne "main") {
-    & git checkout -b main 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        & git branch -M main 2>$null
-    }
-}
-Write-Host "    Done" -ForegroundColor Green
-
-# STEP 4: Add files
-Write-Host "[2/5] Adding files..." -ForegroundColor Cyan
-& git add .
-Write-Host "    Done" -ForegroundColor Green
-
-# STEP 5: Commit
-Write-Host "[3/5] Creating commit..." -ForegroundColor Cyan
-$commitMsg = "Initial commit: NetScanner Pro"
-& git commit -m $commitMsg
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Commit failed. Please check git installation." -ForegroundColor Red
-    Read-Host "Press Enter to exit"
-    exit 1
-}
-Write-Host "    Done" -ForegroundColor Green
-
-# STEP 6: Set remote
-Write-Host "[4/5] Setting remote..." -ForegroundColor Cyan
-$remoteUrl = "https://github.com/" + $githubUser + "/" + $repoName + ".git"
-Write-Host "    Remote URL: $remoteUrl" -ForegroundColor Gray
-& git remote add origin $remoteUrl
-Write-Host "    Verifying remote:" -ForegroundColor Gray
-& git remote -v
-Write-Host "    Done" -ForegroundColor Green
-
-# STEP 7: Push - override any credential manager with explicit Basic Auth header
-Write-Host "[5/5] Pushing to GitHub..." -ForegroundColor Cyan
-
-# Build Base64 auth: litontechtw-star:TOKEN
+# Setup auth header
 $authString = $githubUser + ":" + $token
 $base64Auth = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($authString))
 $authHeader = "Authorization: Basic " + $base64Auth
 
-Write-Host "    Auth user: $githubUser" -ForegroundColor Gray
-Write-Host "    Header set: YES" -ForegroundColor Gray
+# Navigate to script directory
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $scriptDir
 
-# Single-line push with explicit credential override
+# Configure git user
+& git config user.email $gitEmail
+& git config user.name $gitName
+
+# Check if already a git repo
+if (-not (Test-Path ".git")) {
+    Write-Host "[1/4] Initializing Git..." -ForegroundColor Cyan
+    & git init
+    & git checkout -b main 2>$null
+    if ($LASTEXITCODE -ne 0) { & git branch -M main 2>$null }
+
+    $remoteUrl = "https://github.com/" + $githubUser + "/" + $repoName + ".git"
+    & git remote add origin $remoteUrl
+    Write-Host "    Done" -ForegroundColor Green
+} else {
+    Write-Host "[1/4] Git repo exists, using existing..." -ForegroundColor Cyan
+    # Update remote URL in case it changed
+    $remoteUrl = "https://github.com/" + $githubUser + "/" + $repoName + ".git"
+    & git remote set-url origin $remoteUrl 2>$null
+    Write-Host "    Done" -ForegroundColor Green
+}
+
+# Stage all changes
+Write-Host "[2/4] Staging changes..." -ForegroundColor Cyan
+& git add .
+$status = & git status --short
+if ([string]::IsNullOrWhiteSpace($status)) {
+    Write-Host "    No changes to commit." -ForegroundColor Yellow
+} else {
+    Write-Host "    Changed files:" -ForegroundColor Gray
+    $status | ForEach-Object { Write-Host "      $_" -ForegroundColor Gray }
+}
+Write-Host "    Done" -ForegroundColor Green
+
+# Commit
+Write-Host "[3/4] Committing..." -ForegroundColor Cyan
+$timestamp = Get-Date -Format "yyyy-MM-dd HH:mm"
+& git commit -m "Fix: add mipmap icons ($timestamp)" 2>&1 | Out-String | Write-Host -ForegroundColor Gray
+Write-Host "    Done" -ForegroundColor Green
+
+# Push
+Write-Host "[4/4] Pushing to GitHub..." -ForegroundColor Cyan
 & git -c "credential.helper=" -c "http.extraHeader=$authHeader" push -u origin main
 
 if ($LASTEXITCODE -eq 0) {
@@ -107,8 +86,8 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "   SUCCESS! APK build has started!" -ForegroundColor Green
     Write-Host "================================================" -ForegroundColor Green
     Write-Host ""
-    Write-Host "Check build progress (ready in ~5 min):" -ForegroundColor Cyan
     $actionsUrl = "https://github.com/" + $githubUser + "/" + $repoName + "/actions"
+    Write-Host "Check build progress (~3-5 min):" -ForegroundColor Cyan
     Write-Host $actionsUrl -ForegroundColor Green
     Write-Host ""
     Write-Host "Download APK: Actions page -> latest workflow -> Artifacts" -ForegroundColor White
@@ -119,9 +98,9 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "Push failed (code: $LASTEXITCODE)" -ForegroundColor Red
     Write-Host ""
     Write-Host "Possible causes:" -ForegroundColor Yellow
-    Write-Host "  1. Token invalid or expired -> regenerate and retry" -ForegroundColor White
-    Write-Host "  2. Repository does not exist -> create at github.com/new" -ForegroundColor White
-    Write-Host "  3. Repository is not empty -> delete and recreate (no README)" -ForegroundColor White
+    Write-Host "  1. Token invalid/expired -> regenerate at github.com/settings/tokens" -ForegroundColor White
+    Write-Host "  2. Need 'repo' + 'workflow' scopes on token" -ForegroundColor White
+    Write-Host "  3. Repository does not exist -> create at github.com/new" -ForegroundColor White
 }
 
 Write-Host ""
