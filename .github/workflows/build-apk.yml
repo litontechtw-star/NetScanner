@@ -21,17 +21,47 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # ── Android SDK (pre-installed on ubuntu-latest runners) ──
+      - name: Configure Android SDK
+        run: |
+          ANDROID_SDK=/usr/local/lib/android/sdk
+          echo "ANDROID_HOME=$ANDROID_SDK"     >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK" >> $GITHUB_ENV
+          echo "$ANDROID_SDK/platform-tools"   >> $GITHUB_PATH
+          # Accept licenses
+          yes | $ANDROID_SDK/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          # Install required SDK components
+          $ANDROID_SDK/cmdline-tools/latest/bin/sdkmanager \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" || true
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.4'
+      # ── Download Gradle 8.4 directly (no caching action) ──────
+      - name: Install Gradle 8.4
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.4-bin.zip \
+               -O /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /opt/gradle-dist
+          echo "/opt/gradle-dist/gradle-8.4/bin" >> $GITHUB_PATH
+          # Copy wrapper JAR from the downloaded distribution
+          mkdir -p gradle/wrapper
+          cp /opt/gradle-dist/gradle-8.4/lib/gradle-wrapper-*.jar \
+             gradle/wrapper/gradle-wrapper.jar 2>/dev/null || \
+          find /opt/gradle-dist -name "gradle-wrapper.jar" -exec cp {} gradle/wrapper/gradle-wrapper.jar \;
+          echo "Gradle wrapper jar: $(ls -lh gradle/wrapper/gradle-wrapper.jar)"
+
+      - name: Verify environment
+        run: |
+          gradle --version
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls $ANDROID_HOME/platforms/ || true
+
+      # ── Build ──────────────────────────────────────────────────
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
 
       - name: Build Debug APK
-        run: gradle assembleDebug --stacktrace
-        working-directory: ${{ github.workspace }}
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
@@ -40,8 +70,7 @@ jobs:
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
 
-      - name: Show APK info
+      - name: Show result
         run: |
-          echo "Build complete!"
-          ls -lh app/build/outputs/apk/debug/ 2>/dev/null || echo "APK path check..."
+          echo "Build done!"
           find . -name "*.apk" 2>/dev/null
