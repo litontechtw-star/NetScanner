@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NetScanner Pro</string>
+    <string name="tab_speed_test">測速</string>
+    <string name="tab_wifi_scan">WiFi 掃描</string>
+    <string name="tab_signal">訊號品質</string>
+</resources>
