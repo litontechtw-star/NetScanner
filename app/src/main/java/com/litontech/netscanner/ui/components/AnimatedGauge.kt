@@ -1,7 +1,7 @@
 package com.litontech.netscanner.ui.components
 
 import androidx.compose.animation.core.*
-import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
