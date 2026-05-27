@@ -11,7 +11,7 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.util.Collections
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -47,20 +47,22 @@ class SpeedTestViewModel(app: Application) : AndroidViewModel(app) {
     private val _uiState = MutableStateFlow(SpeedTestUiState())
     val uiState: StateFlow<SpeedTestUiState> = _uiState.asStateFlow()
 
-    // Longer timeouts for multi-stream parallel test
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(90, TimeUnit.SECONDS)
-        .writeTimeout(90, TimeUnit.SECONDS)
+        .readTimeout(60,  TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
-    // 4 parallel download streams — all point to Cloudflare's speed endpoint
-    // which supports arbitrary payload sizes and doesn't throttle parallel connections
-    private val downloadUrl = "https://speed.cloudflare.com/__down?bytes=250000000"
-    private val uploadUrl   = "https://speed.cloudflare.com/__up"
+    // 25 MB chunks — within Cloudflare's confirmed supported range.
+    // Workers loop indefinitely; the time-gate in the progress loop stops them.
+    private val downloadChunkUrl = "https://speed.cloudflare.com/__down?bytes=25000000"
+    private val uploadUrl        = "https://speed.cloudflare.com/__up"
+
+    private var testJob: Job? = null
 
     init { refreshNetworkInfo() }
 
+    // ─── Network info ─────────────────────────────────────────────────────────
     fun refreshNetworkInfo() {
         val cm   = getApplication<Application>().getSystemService(ConnectivityManager::class.java)
         val cap  = cm.getNetworkCapabilities(cm.activeNetwork)
@@ -82,9 +84,10 @@ class SpeedTestViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ─── Main test sequence ───────────────────────────────────────────────────
+    // ─── Public: start / reset ────────────────────────────────────────────────
     fun startTest() {
-        viewModelScope.launch {
+        testJob?.cancel()
+        testJob = viewModelScope.launch {
             _uiState.update {
                 SpeedTestUiState(
                     state       = TestState.PINGING,
@@ -93,7 +96,7 @@ class SpeedTestViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
 
-            // 1. Ping (8 samples, drop 2 highest TCP spikes, report avg+jitter)
+            // ── 1. Ping ──────────────────────────────────────────────────────
             val pings   = measurePing()
             val avgPing = pings.average().toLong()
             val jitter  = if (pings.size > 1)
@@ -107,12 +110,16 @@ class SpeedTestViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
 
-            // 2. Download: 4 parallel streams × 250 MB, 12 s measured + 2.5 s warmup
-            val downloadMbps = try {
-                measureDownloadParallel { speed, prog ->
-                    _uiState.update { it.copy(currentSpeedMbps = speed, progressFraction = prog) }
-                }
-            } catch (_: Exception) { 0f }
+            // ── 2. Download ──────────────────────────────────────────────────
+            // 4 parallel streams, 2.5 s warmup + 12 s measurement = 14.5 s total
+            val downloadMbps = runSpeedTest(
+                isDownload = true,
+                streams    = 4,
+                warmupMs   = 2_500L,
+                measureMs  = 12_000L
+            ) { speed, prog ->
+                _uiState.update { it.copy(currentSpeedMbps = speed, progressFraction = prog) }
+            }
 
             _uiState.update {
                 it.copy(
@@ -123,12 +130,16 @@ class SpeedTestViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
 
-            // 3. Upload: 3 parallel streams × 10 MB/request, 10 s measured + 1.5 s warmup
-            val uploadMbps = try {
-                measureUploadParallel { speed, prog ->
-                    _uiState.update { it.copy(currentSpeedMbps = speed, progressFraction = prog) }
-                }
-            } catch (_: Exception) { 0f }
+            // ── 3. Upload ────────────────────────────────────────────────────
+            // 3 parallel streams, 1.5 s warmup + 10 s measurement = 11.5 s total
+            val uploadMbps = runSpeedTest(
+                isDownload = false,
+                streams    = 3,
+                warmupMs   = 1_500L,
+                measureMs  = 10_000L
+            ) { speed, prog ->
+                _uiState.update { it.copy(currentSpeedMbps = speed, progressFraction = prog) }
+            }
 
             _uiState.update {
                 it.copy(
@@ -138,7 +149,7 @@ class SpeedTestViewModel(app: Application) : AndroidViewModel(app) {
                     result = it.result?.copy(
                         downloadMbps = downloadMbps,
                         uploadMbps   = uploadMbps,
-                        serverName   = "Cloudflare (4-stream)"
+                        serverName   = "Cloudflare (多串流)"
                     )
                 )
             }
@@ -146,12 +157,13 @@ class SpeedTestViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun resetTest() {
+        testJob?.cancel()
         _uiState.update { SpeedTestUiState(networkType = it.networkType, ipAddress = it.ipAddress) }
     }
 
     // ─── Ping ─────────────────────────────────────────────────────────────────
     private suspend fun measurePing(): List<Long> = withContext(Dispatchers.IO) {
-        // Warm-up (not counted — flushes TCP connection setup overhead)
+        // One warm-up request to open the TCP connection (not measured)
         runCatching {
             client.newCall(Request.Builder().url("https://1.1.1.1").head().build()).execute().close()
         }
@@ -177,148 +189,153 @@ class SpeedTestViewModel(app: Application) : AndroidViewModel(app) {
         results.sorted().dropLast(2).ifEmpty { results }
     }
 
-    // ─── Download: 4 parallel streams, time-based ────────────────────────────
-    private suspend fun measureDownloadParallel(
-        onProgress: suspend (Float, Float) -> Unit
+    // ─── Generic parallel speed measurement ──────────────────────────────────
+    //
+    // Design rationale:
+    //  • Workers are children of `coroutineScope`, guaranteeing structured cleanup.
+    //  • Each worker loops 25 MB requests endlessly; the `stopFlag` + OkHttp
+    //    call.cancel() cooperate to stop them the instant the test window closes.
+    //  • The try-finally ensures cleanup even on external cancellation (e.g. reset).
+    //  • Samples are collected only after the warmup window to skip TCP slow-start.
+    //
+    private suspend fun runSpeedTest(
+        isDownload: Boolean,
+        streams:    Int,
+        warmupMs:   Long,
+        measureMs:  Long,
+        onProgress: (Float, Float) -> Unit
     ): Float = coroutineScope {
-        val CONNECTIONS = 4
-        val WARMUP_MS   = 2_500L
-        val TEST_MS     = 12_000L
-        val TOTAL_MS    = WARMUP_MS + TEST_MS   // 14.5 s
 
-        val counter = AtomicLong(0)
-        val start   = System.currentTimeMillis()
-        val samples = Collections.synchronizedList(mutableListOf<Float>())
-        val calls   = Collections.synchronizedList(mutableListOf<Call>())
+        val totalMs     = warmupMs + measureMs
+        val counter     = AtomicLong(0)
+        val start       = System.currentTimeMillis()
+        val samples     = mutableListOf<Float>()
+        val stopFlag    = AtomicBoolean(false)
+        val activeCalls = CopyOnWriteArrayList<Call>()
 
-        // 4 independent download streams
-        val jobs = (0 until CONNECTIONS).map {
-            async(Dispatchers.IO) {
-                try {
-                    val req  = Request.Builder()
-                        .url(downloadUrl)
-                        .header("Cache-Control", "no-cache")
-                        .build()
-                    val call = client.newCall(req)
-                    calls.add(call)
-                    call.execute().use { resp ->
-                        val buf    = ByteArray(65_536)
-                        val stream = resp.body?.byteStream() ?: return@use
-                        while (true) {
-                            val n = stream.read(buf)
-                            if (n == -1) break
-                            counter.addAndGet(n.toLong())
-                        }
-                    }
-                } catch (_: Exception) {}
+        // Workers are launched as children of this coroutineScope.
+        // They run on Dispatchers.IO (blocking network I/O is fine there).
+        val workers = (0 until streams).map {
+            launch(Dispatchers.IO) {
+                if (isDownload) downloadLoop(activeCalls, counter, stopFlag)
+                else            uploadLoop(activeCalls, counter, stopFlag)
             }
         }
 
-        // Progress reporter runs until time is up
-        var lastBytes = 0L; var lastTime = start
-        while (System.currentTimeMillis() - start < TOTAL_MS) {
-            delay(400)
-            val now      = System.currentTimeMillis()
-            val bytes    = counter.get()
-            val dB       = bytes - lastBytes
-            val dT       = (now - lastTime) / 1000f
-            val speed    = if (dT > 0f) (dB * 8f) / (dT * 1_000_000f) else 0f
-            val elapsed  = now - start
-            val progress = ((elapsed - WARMUP_MS).coerceAtLeast(0).toFloat() / TEST_MS).coerceIn(0f, 1f)
-            // Only collect samples after warmup (skips TCP slow-start ramp)
-            if (elapsed > WARMUP_MS && speed > 0f) samples.add(speed)
-            onProgress(speed, progress)
-            lastBytes = bytes; lastTime = now
+        try {
+            // Progress reporter (runs on calling dispatcher — usually Main)
+            var lastBytes = 0L
+            var lastTime  = start
+            while (System.currentTimeMillis() - start < totalMs) {
+                delay(400)
+                val now      = System.currentTimeMillis()
+                val bytes    = counter.get()
+                val dB       = bytes - lastBytes
+                val dT       = (now - lastTime) / 1000f
+                val speed    = if (dT > 0f) (dB * 8f) / (dT * 1_000_000f) else 0f
+                val elapsed  = now - start
+                val progress = ((elapsed - warmupMs).coerceAtLeast(0).toFloat() / measureMs)
+                    .coerceIn(0f, 1f)
+                // Collect speed samples only after warmup (skips TCP slow-start ramp)
+                if (elapsed > warmupMs && speed > 0f) samples.add(speed)
+                onProgress(speed, progress)
+                lastBytes = bytes
+                lastTime  = now
+            }
+        } finally {
+            // Signal workers to stop, then forcefully close all open HTTP connections.
+            // call.cancel() causes stream.read() / sink.flush() to throw IOException
+            // immediately, so workers exit within milliseconds.
+            stopFlag.set(true)
+            activeCalls.forEach { it.cancel() }
         }
 
-        // Cancel OkHttp calls → triggers IOException in blocking reads → coroutines finish
-        calls.forEach { it.cancel() }
-        jobs.awaitAll()
+        // Wait for all worker coroutines to finish.
+        // They will exit quickly after their blocking calls are interrupted above.
+        workers.forEach { it.join() }
 
         trimmedMean(samples)
     }
 
-    // ─── Upload: 3 parallel streams, time-based ──────────────────────────────
-    private suspend fun measureUploadParallel(
-        onProgress: suspend (Float, Float) -> Unit
-    ): Float = coroutineScope {
-        val CONNECTIONS = 3
-        val WARMUP_MS   = 1_500L
-        val TEST_MS     = 10_000L
-        val TOTAL_MS    = WARMUP_MS + TEST_MS  // 11.5 s
-
-        val counter = AtomicLong(0)
-        val start   = System.currentTimeMillis()
-        val samples = Collections.synchronizedList(mutableListOf<Float>())
-        val running = AtomicBoolean(true)
-        val calls   = Collections.synchronizedList(mutableListOf<Call>())
-
-        // Pseudo-random data to avoid transparent compression on some networks
-        val chunk = ByteArray(65_536) { (it * 7 + 13).toByte() }
-
-        val jobs = (0 until CONNECTIONS).map {
-            async(Dispatchers.IO) {
-                // Each stream keeps issuing 10 MB upload requests until time expires
-                while (running.get() && System.currentTimeMillis() - start < TOTAL_MS) {
-                    val PAYLOAD = 10_000_000L
-                    val bytesSent = AtomicLong(0)
-                    val body = object : RequestBody() {
-                        override fun contentType() = "application/octet-stream".toMediaType()
-                        override fun contentLength() = PAYLOAD
-                        override fun writeTo(sink: okio.BufferedSink) {
-                            var remaining = PAYLOAD
-                            while (remaining > 0 && running.get()) {
-                                val n = minOf(chunk.size.toLong(), remaining).toInt()
-                                sink.write(chunk, 0, n)
-                                sink.flush()
-                                counter.addAndGet(n.toLong())
-                                bytesSent.addAndGet(n.toLong())
-                                remaining -= n
-                            }
-                        }
+    // ─── Download worker (blocking — runs on IO thread) ──────────────────────
+    private fun downloadLoop(
+        activeCalls: MutableList<Call>,
+        counter:     AtomicLong,
+        stopFlag:    AtomicBoolean
+    ) {
+        val buf = ByteArray(65_536)
+        while (!stopFlag.get()) {
+            val req  = Request.Builder()
+                .url(downloadChunkUrl)
+                .header("Cache-Control", "no-cache")
+                .build()
+            val call = client.newCall(req)
+            activeCalls.add(call)
+            // Guard: stop flag might have been set between the add and here
+            if (stopFlag.get()) { call.cancel(); activeCalls.remove(call); return }
+            try {
+                call.execute().use { resp ->
+                    val stream = resp.body?.byteStream() ?: return
+                    while (true) {
+                        val n = stream.read(buf)
+                        if (n == -1) break   // EOF → outer loop re-requests
+                        counter.addAndGet(n.toLong())
                     }
-                    try {
-                        val req  = Request.Builder().url(uploadUrl).post(body).build()
-                        val call = client.newCall(req)
-                        calls.add(call)
-                        call.execute().close()
-                        calls.remove(call)
-                    } catch (_: Exception) { break }
+                }
+                activeCalls.remove(call)
+                // Loop continues: immediately request the next 25 MB chunk
+            } catch (_: Exception) {
+                activeCalls.remove(call)
+                return   // Canceled (or network error) → exit worker
+            }
+        }
+    }
+
+    // ─── Upload worker (blocking — runs on IO thread) ────────────────────────
+    private fun uploadLoop(
+        activeCalls: MutableList<Call>,
+        counter:     AtomicLong,
+        stopFlag:    AtomicBoolean
+    ) {
+        // Pseudo-random data defeats transparent compression proxies
+        val chunk   = ByteArray(65_536) { (it * 7 + 13).toByte() }
+        val PAYLOAD = 5_000_000L   // 5 MB per request
+
+        while (!stopFlag.get()) {
+            val body = object : RequestBody() {
+                override fun contentType()   = "application/octet-stream".toMediaType()
+                override fun contentLength() = PAYLOAD
+                override fun writeTo(sink: okio.BufferedSink) {
+                    var remaining = PAYLOAD
+                    while (remaining > 0) {
+                        val n = minOf(chunk.size.toLong(), remaining).toInt()
+                        sink.write(chunk, 0, n)
+                        sink.flush()
+                        counter.addAndGet(n.toLong())
+                        remaining -= n
+                    }
                 }
             }
+            val req  = Request.Builder().url(uploadUrl).post(body).build()
+            val call = client.newCall(req)
+            activeCalls.add(call)
+            if (stopFlag.get()) { call.cancel(); activeCalls.remove(call); return }
+            try {
+                call.execute().close()
+                activeCalls.remove(call)
+            } catch (_: Exception) {
+                activeCalls.remove(call)
+                return
+            }
         }
-
-        // Progress reporter
-        var lastBytes = 0L; var lastTime = start
-        while (System.currentTimeMillis() - start < TOTAL_MS) {
-            delay(400)
-            val now      = System.currentTimeMillis()
-            val bytes    = counter.get()
-            val dB       = bytes - lastBytes
-            val dT       = (now - lastTime) / 1000f
-            val speed    = if (dT > 0f) (dB * 8f) / (dT * 1_000_000f) else 0f
-            val elapsed  = now - start
-            val progress = ((elapsed - WARMUP_MS).coerceAtLeast(0).toFloat() / TEST_MS).coerceIn(0f, 1f)
-            if (elapsed > WARMUP_MS && speed > 0f) samples.add(speed)
-            onProgress(speed, progress)
-            lastBytes = bytes; lastTime = now
-        }
-
-        running.set(false)
-        calls.forEach { it.cancel() }
-        jobs.awaitAll()
-
-        trimmedMean(samples)
     }
 
-    // ─── Helpers ──────────────────────────────────────────────────────────────
-    // Trim bottom 10% and top 10% outliers then return mean
+    // ─── Trimmed mean (drop bottom 10 % and top 10 % outliers) ──────────────
     private fun trimmedMean(samples: List<Float>): Float {
         if (samples.isEmpty()) return 0f
         val sorted = samples.sorted()
-        val lo = (sorted.size * 0.10).toInt()
-        val hi = (sorted.size * 0.90).toInt().coerceAtLeast(lo + 1)
-        val trimmed = if (hi <= sorted.size) sorted.subList(lo, hi) else sorted
-        return trimmed.average().toFloat()
+        val lo     = (sorted.size * 0.10).toInt()
+        val hi     = (sorted.size * 0.90).toInt().coerceAtLeast(lo + 1).coerceAtMost(sorted.size)
+        return sorted.subList(lo, hi).average().toFloat()
     }
 }
