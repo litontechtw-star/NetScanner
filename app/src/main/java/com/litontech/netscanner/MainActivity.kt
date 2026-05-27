@@ -49,19 +49,21 @@ sealed class Screen(
     val icon:     ImageVector,
     val iconSel:  ImageVector
 ) {
-    object SpeedTest : Screen("speed_test",  "測速",       Icons.Filled.Speed,       Icons.Filled.Speed)
-    object WifiScan  : Screen("wifi_scan",   "WiFi 掃描",  Icons.Filled.WifiFind,    Icons.Filled.WifiFind)
-    object Signal    : Screen("signal",      "訊號品質",   Icons.Filled.SignalCellularAlt, Icons.Filled.SignalCellularAlt)
+    object SpeedTest  : Screen("speed_test",  "測速",       Icons.Filled.Speed,            Icons.Filled.Speed)
+    object WifiScan   : Screen("wifi_scan",   "WiFi",       Icons.Filled.WifiFind,         Icons.Filled.WifiFind)
+    object Signal     : Screen("signal",      "訊號",       Icons.Filled.SignalCellularAlt, Icons.Filled.SignalCellularAlt)
+    object Direction  : Screen("direction",   "定向",       Icons.Filled.Explore,          Icons.Filled.Explore)
 }
 
-val navScreens = listOf(Screen.SpeedTest, Screen.WifiScan, Screen.Signal)
+val navScreens = listOf(Screen.SpeedTest, Screen.WifiScan, Screen.Signal, Screen.Direction)
 
 // ─── Root Composable ──────────────────────────────────────────────────────────
 @Composable
 fun NetScannerApp() {
-    val navController  = rememberNavController()
-    val speedTestVm: SpeedTestViewModel = viewModel()
-    val wifiVm:      WifiViewModel      = viewModel()
+    val navController   = rememberNavController()
+    val speedTestVm: SpeedTestViewModel  = viewModel()
+    val wifiVm:      WifiViewModel       = viewModel()
+    val directionVm: DirectionViewModel  = viewModel()
 
     Scaffold(
         containerColor = DeepSpace,
@@ -74,22 +76,15 @@ fun NetScannerApp() {
             navController      = navController,
             startDestination   = Screen.SpeedTest.route,
             modifier           = Modifier.padding(innerPadding),
-            enterTransition    = {
-                fadeIn(tween(200)) + slideInHorizontally(tween(200))
-            },
-            exitTransition     = {
-                fadeOut(tween(150)) + slideOutHorizontally(tween(150))
-            },
-            popEnterTransition = {
-                fadeIn(tween(200)) + slideInHorizontally(tween(200)) { -it / 3 }
-            },
-            popExitTransition  = {
-                fadeOut(tween(150)) + slideOutHorizontally(tween(150)) { it / 3 }
-            }
+            enterTransition    = { fadeIn(tween(200)) + slideInHorizontally(tween(200)) },
+            exitTransition     = { fadeOut(tween(150)) + slideOutHorizontally(tween(150)) },
+            popEnterTransition = { fadeIn(tween(200)) + slideInHorizontally(tween(200)) { -it / 3 } },
+            popExitTransition  = { fadeOut(tween(150)) + slideOutHorizontally(tween(150)) { it / 3 } }
         ) {
-            composable(Screen.SpeedTest.route) { SpeedTestScreen(vm = speedTestVm) }
-            composable(Screen.WifiScan.route)  { WifiScanScreen(vm = wifiVm) }
-            composable(Screen.Signal.route)    { SignalQualityScreen(vm = wifiVm) }
+            composable(Screen.SpeedTest.route)  { SpeedTestScreen(vm = speedTestVm) }
+            composable(Screen.WifiScan.route)   { WifiScanScreen(vm = wifiVm) }
+            composable(Screen.Signal.route)     { SignalQualityScreen(vm = wifiVm) }
+            composable(Screen.Direction.route)  { DirectionFinderScreen(vm = directionVm) }
         }
     }
 }
@@ -124,7 +119,7 @@ fun NetScannerBottomBar(navController: androidx.navigation.NavHostController) {
         Row(
             modifier              = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 8.dp)
+                .padding(horizontal = 4.dp, vertical = 8.dp)
                 .navigationBarsPadding(),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
@@ -163,29 +158,37 @@ private fun NavBarItem(
         label         = "navAlpha"
     )
 
+    // Accent color differs per tab
+    val accentColor = when (screen) {
+        Screen.SpeedTest -> CyanPrimary
+        Screen.WifiScan  -> NeonGreen
+        Screen.Signal    -> NeonPurple
+        Screen.Direction -> NeonOrange
+        else             -> CyanPrimary
+    }
+
     Column(
-        modifier              = Modifier
+        modifier = Modifier
             .scale(animatedScale)
             .clickable(
-                indication             = null,
-                interactionSource      = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
-                onClick                = onClick
+                indication        = null,
+                interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                onClick           = onClick
             )
-            .padding(horizontal = 20.dp, vertical = 6.dp),
-        horizontalAlignment   = Alignment.CenterHorizontally,
-        verticalArrangement   = Arrangement.spacedBy(4.dp)
+            .padding(horizontal = 14.dp, vertical = 6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
-        // Icon with glow background
         Box(
             modifier = Modifier
                 .size(40.dp)
                 .background(
-                    color = CyanPrimary.copy(alpha = 0.15f * indicatorAlpha),
+                    color = accentColor.copy(alpha = 0.15f * indicatorAlpha),
                     shape = RoundedCornerShape(12.dp)
                 )
                 .border(
                     1.dp,
-                    CyanPrimary.copy(alpha = 0.4f * indicatorAlpha),
+                    accentColor.copy(alpha = 0.4f * indicatorAlpha),
                     RoundedCornerShape(12.dp)
                 ),
             contentAlignment = Alignment.Center
@@ -193,15 +196,14 @@ private fun NavBarItem(
             Icon(
                 imageVector        = if (isSelected) screen.iconSel else screen.icon,
                 contentDescription = screen.label,
-                tint               = if (isSelected) CyanPrimary else TextMuted,
+                tint               = if (isSelected) accentColor else TextMuted,
                 modifier           = Modifier.size(22.dp)
             )
         }
-        // Label
         Text(
             text       = screen.label,
             fontSize   = 10.sp,
-            color      = if (isSelected) CyanPrimary else TextMuted,
+            color      = if (isSelected) accentColor else TextMuted,
             fontWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal,
             maxLines   = 1
         )

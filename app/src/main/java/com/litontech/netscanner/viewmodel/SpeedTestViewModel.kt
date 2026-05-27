@@ -9,11 +9,12 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
-import kotlin.math.roundToInt
+import java.util.Collections
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data models
@@ -25,18 +26,17 @@ data class SpeedTestResult(
     val jitterMs:     Long   = 0L,
     val downloadMbps: Float  = 0f,
     val uploadMbps:   Float  = 0f,
-    val packetLoss:   Float  = 0f,
     val serverName:   String = ""
 )
 
 data class SpeedTestUiState(
-    val state:           TestState        = TestState.IDLE,
-    val currentSpeedMbps:Float            = 0f,
-    val progressFraction:Float            = 0f,
-    val result:          SpeedTestResult? = null,
-    val errorMsg:        String           = "",
-    val networkType:     String           = "Unknown",
-    val ipAddress:       String           = ""
+    val state:            TestState        = TestState.IDLE,
+    val currentSpeedMbps: Float            = 0f,
+    val progressFraction: Float            = 0f,
+    val result:           SpeedTestResult? = null,
+    val errorMsg:         String           = "",
+    val networkType:      String           = "Unknown",
+    val ipAddress:        String           = ""
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47,28 +47,23 @@ class SpeedTestViewModel(app: Application) : AndroidViewModel(app) {
     private val _uiState = MutableStateFlow(SpeedTestUiState())
     val uiState: StateFlow<SpeedTestUiState> = _uiState.asStateFlow()
 
+    // Longer timeouts for multi-stream parallel test
     private val client = OkHttpClient.Builder()
-        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-        .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .writeTimeout(90, TimeUnit.SECONDS)
         .build()
 
-    // Download test servers: multiple CDN endpoints for reliability
-    private val downloadUrls = listOf(
-        "https://speed.cloudflare.com/__down?bytes=25000000",     // 25 MB
-        "https://bouygues.testdebit.info/25M.iso",                // 25 MB
-        "https://proof.ovh.net/files/10Mb.dat"                    // 10 MB fallback
-    )
-
-    private val uploadUrl = "https://speed.cloudflare.com/__up"
+    // 4 parallel download streams — all point to Cloudflare's speed endpoint
+    // which supports arbitrary payload sizes and doesn't throttle parallel connections
+    private val downloadUrl = "https://speed.cloudflare.com/__down?bytes=250000000"
+    private val uploadUrl   = "https://speed.cloudflare.com/__up"
 
     init { refreshNetworkInfo() }
 
     fun refreshNetworkInfo() {
-        val cm = getApplication<Application>()
-            .getSystemService(ConnectivityManager::class.java)
-        val network = cm.activeNetwork
-        val cap     = cm.getNetworkCapabilities(network)
+        val cm   = getApplication<Application>().getSystemService(ConnectivityManager::class.java)
+        val cap  = cm.getNetworkCapabilities(cm.activeNetwork)
         val type = when {
             cap == null -> "無網路連線"
             cap.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)     -> "Wi-Fi"
@@ -78,218 +73,252 @@ class SpeedTestViewModel(app: Application) : AndroidViewModel(app) {
         }
         viewModelScope.launch(Dispatchers.IO) {
             val ip = try {
-                val sock = Socket()
-                sock.connect(InetSocketAddress("8.8.8.8", 53), 3000)
-                val addr = sock.localAddress.hostAddress ?: "Unknown"
-                sock.close(); addr
-            } catch (e: Exception) { "無法取得" }
+                Socket().use { s ->
+                    s.connect(InetSocketAddress("8.8.8.8", 53), 3000)
+                    s.localAddress.hostAddress ?: "Unknown"
+                }
+            } catch (_: Exception) { "無法取得" }
             _uiState.update { it.copy(networkType = type, ipAddress = ip) }
         }
     }
 
-    // ─── Main test sequence ────────────────────────────────────────────────
+    // ─── Main test sequence ───────────────────────────────────────────────────
     fun startTest() {
         viewModelScope.launch {
-            _uiState.update { SpeedTestUiState(state = TestState.PINGING, networkType = it.networkType, ipAddress = it.ipAddress) }
-
-            // 1. Ping test
-            val pingResults = measurePing()
-            val avgPing  = pingResults.average().toLong()
-            val jitter   = if (pingResults.size > 1) {
-                (pingResults.zipWithNext { a, b -> Math.abs(a - b) }.average()).toLong()
-            } else 0L
-
-            _uiState.update { it.copy(
-                state    = TestState.TESTING_DOWNLOAD,
-                result   = SpeedTestResult(pingMs = avgPing, jitterMs = jitter)
-            )}
-
-            // 2. Download speed
-            var downloadMbps = 0f
-            try {
-                downloadMbps = measureDownloadSpeed { speed, progress ->
-                    _uiState.update { it.copy(currentSpeedMbps = speed, progressFraction = progress) }
-                }
-            } catch (e: Exception) {
-                // Try fallback
-                try {
-                    downloadMbps = measureDownloadSpeedFallback { speed, progress ->
-                        _uiState.update { it.copy(currentSpeedMbps = speed, progressFraction = progress) }
-                    }
-                } catch (ex: Exception) { /* ignore */ }
+            _uiState.update {
+                SpeedTestUiState(
+                    state       = TestState.PINGING,
+                    networkType = it.networkType,
+                    ipAddress   = it.ipAddress
+                )
             }
 
-            _uiState.update { it.copy(
-                state            = TestState.TESTING_UPLOAD,
-                currentSpeedMbps = 0f,
-                progressFraction = 0f,
-                result           = it.result?.copy(downloadMbps = downloadMbps)
-            )}
+            // 1. Ping (8 samples, drop 2 highest TCP spikes, report avg+jitter)
+            val pings   = measurePing()
+            val avgPing = pings.average().toLong()
+            val jitter  = if (pings.size > 1)
+                pings.zipWithNext { a, b -> kotlin.math.abs(a - b) }.average().toLong()
+            else 0L
 
-            // 3. Upload speed
-            var uploadMbps = 0f
-            try {
-                uploadMbps = measureUploadSpeed { speed, progress ->
-                    _uiState.update { it.copy(currentSpeedMbps = speed, progressFraction = progress) }
-                }
-            } catch (e: Exception) { /* ignore */ }
-
-            // Done
-            _uiState.update { it.copy(
-                state            = TestState.DONE,
-                currentSpeedMbps = 0f,
-                progressFraction = 1f,
-                result           = it.result?.copy(
-                    downloadMbps = downloadMbps,
-                    uploadMbps   = uploadMbps,
-                    serverName   = "Cloudflare Speed Test"
+            _uiState.update {
+                it.copy(
+                    state  = TestState.TESTING_DOWNLOAD,
+                    result = SpeedTestResult(pingMs = avgPing, jitterMs = jitter)
                 )
-            )}
+            }
+
+            // 2. Download: 4 parallel streams × 250 MB, 12 s measured + 2.5 s warmup
+            val downloadMbps = try {
+                measureDownloadParallel { speed, prog ->
+                    _uiState.update { it.copy(currentSpeedMbps = speed, progressFraction = prog) }
+                }
+            } catch (_: Exception) { 0f }
+
+            _uiState.update {
+                it.copy(
+                    state            = TestState.TESTING_UPLOAD,
+                    currentSpeedMbps = 0f,
+                    progressFraction = 0f,
+                    result           = it.result?.copy(downloadMbps = downloadMbps)
+                )
+            }
+
+            // 3. Upload: 3 parallel streams × 10 MB/request, 10 s measured + 1.5 s warmup
+            val uploadMbps = try {
+                measureUploadParallel { speed, prog ->
+                    _uiState.update { it.copy(currentSpeedMbps = speed, progressFraction = prog) }
+                }
+            } catch (_: Exception) { 0f }
+
+            _uiState.update {
+                it.copy(
+                    state            = TestState.DONE,
+                    currentSpeedMbps = 0f,
+                    progressFraction = 1f,
+                    result = it.result?.copy(
+                        downloadMbps = downloadMbps,
+                        uploadMbps   = uploadMbps,
+                        serverName   = "Cloudflare (4-stream)"
+                    )
+                )
+            }
         }
     }
 
     fun resetTest() {
-        _uiState.update {
-            SpeedTestUiState(networkType = it.networkType, ipAddress = it.ipAddress)
-        }
+        _uiState.update { SpeedTestUiState(networkType = it.networkType, ipAddress = it.ipAddress) }
     }
 
-    // ─── Ping measurement ─────────────────────────────────────────────────
+    // ─── Ping ─────────────────────────────────────────────────────────────────
     private suspend fun measurePing(): List<Long> = withContext(Dispatchers.IO) {
+        // Warm-up (not counted — flushes TCP connection setup overhead)
+        runCatching {
+            client.newCall(Request.Builder().url("https://1.1.1.1").head().build()).execute().close()
+        }
         val results = mutableListOf<Long>()
-        repeat(5) {
-            val start = System.currentTimeMillis()
+        repeat(8) {
+            val t0 = System.currentTimeMillis()
             try {
-                val req  = Request.Builder().url("https://1.1.1.1/dns-query").head().build()
-                client.newCall(req).execute().use { /* success */ }
-                results.add(System.currentTimeMillis() - start)
-            } catch (e: Exception) {
-                // fallback: try connecting to 8.8.8.8:443
+                client.newCall(
+                    Request.Builder().url("https://1.1.1.1").head().build()
+                ).execute().close()
+                results.add(System.currentTimeMillis() - t0)
+            } catch (_: Exception) {
                 try {
-                    val sock = Socket()
-                    sock.connect(InetSocketAddress("8.8.8.8", 443), 3000)
-                    results.add(System.currentTimeMillis() - start)
-                    sock.close()
+                    Socket().use { s ->
+                        s.connect(InetSocketAddress("1.1.1.1", 443), 3000)
+                        results.add(System.currentTimeMillis() - t0)
+                    }
                 } catch (_: Exception) {}
             }
-            delay(200)
+            delay(100)
         }
-        results.ifEmpty { listOf(999L) }
+        if (results.isEmpty()) return@withContext listOf(999L)
+        results.sorted().dropLast(2).ifEmpty { results }
     }
 
-    // ─── Download speed ───────────────────────────────────────────────────
-    private suspend fun measureDownloadSpeed(
-        onProgress: suspend (speedMbps: Float, progress: Float) -> Unit
-    ): Float = withContext(Dispatchers.IO) {
-        val url     = downloadUrls[0]
-        val req     = Request.Builder().url(url).build()
-        val call    = client.newCall(req)
-        var totalBytes = 0L
-        val startTime  = System.currentTimeMillis()
-        val windowMs   = 500L   // update every 500ms
-        var windowStart= startTime
-        var windowBytes= 0L
-        val speedHistory = mutableListOf<Float>()
+    // ─── Download: 4 parallel streams, time-based ────────────────────────────
+    private suspend fun measureDownloadParallel(
+        onProgress: suspend (Float, Float) -> Unit
+    ): Float = coroutineScope {
+        val CONNECTIONS = 4
+        val WARMUP_MS   = 2_500L
+        val TEST_MS     = 12_000L
+        val TOTAL_MS    = WARMUP_MS + TEST_MS   // 14.5 s
 
-        call.execute().use { resp ->
-            val body = resp.body ?: throw IOException("No body")
-            val buffer = ByteArray(32_768)
-            val stream = body.byteStream()
-            val contentLength = body.contentLength().takeIf { it > 0 } ?: 25_000_000L
-
-            while (true) {
-                val read = stream.read(buffer)
-                if (read == -1) break
-                totalBytes  += read
-                windowBytes += read
-
-                val now = System.currentTimeMillis()
-                if (now - windowStart >= windowMs) {
-                    val windowSec   = (now - windowStart) / 1000f
-                    val speedMbps   = (windowBytes * 8f) / (windowSec * 1_000_000f)
-                    speedHistory.add(speedMbps)
-                    val progress    = (totalBytes.toFloat() / contentLength).coerceIn(0f, 1f)
-                    withContext(Dispatchers.Main) { onProgress(speedMbps, progress) }
-                    windowStart = now
-                    windowBytes = 0L
-                }
-            }
-        }
-
-        val totalSec = (System.currentTimeMillis() - startTime) / 1000f
-        if (totalSec <= 0f) return@withContext 0f
-        (totalBytes * 8f) / (totalSec * 1_000_000f)
-    }
-
-    private suspend fun measureDownloadSpeedFallback(
-        onProgress: suspend (speedMbps: Float, progress: Float) -> Unit
-    ): Float = withContext(Dispatchers.IO) {
-        val url     = downloadUrls[2]
-        val req     = Request.Builder().url(url).build()
-        var total   = 0L
+        val counter = AtomicLong(0)
         val start   = System.currentTimeMillis()
-        client.newCall(req).execute().use { resp ->
-            val body   = resp.body ?: throw IOException("No body")
-            val buf    = ByteArray(16_384)
-            val stream = body.byteStream()
-            val len    = body.contentLength().takeIf { it > 0 } ?: 10_000_000L
-            while (true) {
-                val read = stream.read(buf)
-                if (read == -1) break
-                total += read
-                val elapsed = (System.currentTimeMillis() - start) / 1000f
-                val speed   = if (elapsed > 0f) (total * 8f) / (elapsed * 1_000_000f) else 0f
-                withContext(Dispatchers.Main) { onProgress(speed, total.toFloat() / len) }
+        val samples = Collections.synchronizedList(mutableListOf<Float>())
+        val calls   = Collections.synchronizedList(mutableListOf<Call>())
+
+        // 4 independent download streams
+        val jobs = (0 until CONNECTIONS).map {
+            async(Dispatchers.IO) {
+                try {
+                    val req  = Request.Builder()
+                        .url(downloadUrl)
+                        .header("Cache-Control", "no-cache")
+                        .build()
+                    val call = client.newCall(req)
+                    calls.add(call)
+                    call.execute().use { resp ->
+                        val buf    = ByteArray(65_536)
+                        val stream = resp.body?.byteStream() ?: return@use
+                        while (true) {
+                            val n = stream.read(buf)
+                            if (n == -1) break
+                            counter.addAndGet(n.toLong())
+                        }
+                    }
+                } catch (_: Exception) {}
             }
         }
-        val elapsed = (System.currentTimeMillis() - start) / 1000f
-        if (elapsed <= 0f) 0f else (total * 8f) / (elapsed * 1_000_000f)
+
+        // Progress reporter runs until time is up
+        var lastBytes = 0L; var lastTime = start
+        while (System.currentTimeMillis() - start < TOTAL_MS) {
+            delay(400)
+            val now      = System.currentTimeMillis()
+            val bytes    = counter.get()
+            val dB       = bytes - lastBytes
+            val dT       = (now - lastTime) / 1000f
+            val speed    = if (dT > 0f) (dB * 8f) / (dT * 1_000_000f) else 0f
+            val elapsed  = now - start
+            val progress = ((elapsed - WARMUP_MS).coerceAtLeast(0).toFloat() / TEST_MS).coerceIn(0f, 1f)
+            // Only collect samples after warmup (skips TCP slow-start ramp)
+            if (elapsed > WARMUP_MS && speed > 0f) samples.add(speed)
+            onProgress(speed, progress)
+            lastBytes = bytes; lastTime = now
+        }
+
+        // Cancel OkHttp calls → triggers IOException in blocking reads → coroutines finish
+        calls.forEach { it.cancel() }
+        jobs.awaitAll()
+
+        trimmedMean(samples)
     }
 
-    // ─── Upload speed ──────────────────────────────────────────────────────
-    private suspend fun measureUploadSpeed(
-        onProgress: suspend (speedMbps: Float, progress: Float) -> Unit
-    ): Float = withContext(Dispatchers.IO) {
-        val uploadBytes = 10_000_000  // 10 MB
-        val chunk       = ByteArray(65_536) { (it % 256).toByte() }
-        val startTime   = System.currentTimeMillis()
-        var bytesSent   = 0L
-        var windowStart = startTime
-        var windowBytes = 0L
-        val windowMs    = 300L
+    // ─── Upload: 3 parallel streams, time-based ──────────────────────────────
+    private suspend fun measureUploadParallel(
+        onProgress: suspend (Float, Float) -> Unit
+    ): Float = coroutineScope {
+        val CONNECTIONS = 3
+        val WARMUP_MS   = 1_500L
+        val TEST_MS     = 10_000L
+        val TOTAL_MS    = WARMUP_MS + TEST_MS  // 11.5 s
 
-        // Use chunked streaming body
-        val body = object : RequestBody() {
-            override fun contentType() = "application/octet-stream".toMediaType()
-            override fun contentLength() = uploadBytes.toLong()
-            override fun writeTo(sink: okio.BufferedSink) {
-                var remaining = uploadBytes
-                while (remaining > 0) {
-                    val toWrite = minOf(chunk.size, remaining)
-                    sink.write(chunk, 0, toWrite)
-                    sink.flush()
-                    remaining   -= toWrite
-                    bytesSent   += toWrite
-                    windowBytes += toWrite
-                    val now = System.currentTimeMillis()
-                    if (now - windowStart >= windowMs) {
-                        val sec   = (now - windowStart) / 1000f
-                        val speed = (windowBytes * 8f) / (sec * 1_000_000f)
-                        val prog  = bytesSent.toFloat() / uploadBytes
-                        runBlocking { withContext(Dispatchers.Main) { onProgress(speed, prog) } }
-                        windowStart = now
-                        windowBytes = 0L
+        val counter = AtomicLong(0)
+        val start   = System.currentTimeMillis()
+        val samples = Collections.synchronizedList(mutableListOf<Float>())
+        val running = AtomicBoolean(true)
+        val calls   = Collections.synchronizedList(mutableListOf<Call>())
+
+        // Pseudo-random data to avoid transparent compression on some networks
+        val chunk = ByteArray(65_536) { (it * 7 + 13).toByte() }
+
+        val jobs = (0 until CONNECTIONS).map {
+            async(Dispatchers.IO) {
+                // Each stream keeps issuing 10 MB upload requests until time expires
+                while (running.get() && System.currentTimeMillis() - start < TOTAL_MS) {
+                    val PAYLOAD = 10_000_000L
+                    val bytesSent = AtomicLong(0)
+                    val body = object : RequestBody() {
+                        override fun contentType() = "application/octet-stream".toMediaType()
+                        override fun contentLength() = PAYLOAD
+                        override fun writeTo(sink: okio.BufferedSink) {
+                            var remaining = PAYLOAD
+                            while (remaining > 0 && running.get()) {
+                                val n = minOf(chunk.size.toLong(), remaining).toInt()
+                                sink.write(chunk, 0, n)
+                                sink.flush()
+                                counter.addAndGet(n.toLong())
+                                bytesSent.addAndGet(n.toLong())
+                                remaining -= n
+                            }
+                        }
                     }
+                    try {
+                        val req  = Request.Builder().url(uploadUrl).post(body).build()
+                        val call = client.newCall(req)
+                        calls.add(call)
+                        call.execute().close()
+                        calls.remove(call)
+                    } catch (_: Exception) { break }
                 }
             }
         }
 
-        val req = Request.Builder().url(uploadUrl).post(body).build()
-        try {
-            client.newCall(req).execute().use { /* just consume response */ }
-        } catch (_: Exception) {}
+        // Progress reporter
+        var lastBytes = 0L; var lastTime = start
+        while (System.currentTimeMillis() - start < TOTAL_MS) {
+            delay(400)
+            val now      = System.currentTimeMillis()
+            val bytes    = counter.get()
+            val dB       = bytes - lastBytes
+            val dT       = (now - lastTime) / 1000f
+            val speed    = if (dT > 0f) (dB * 8f) / (dT * 1_000_000f) else 0f
+            val elapsed  = now - start
+            val progress = ((elapsed - WARMUP_MS).coerceAtLeast(0).toFloat() / TEST_MS).coerceIn(0f, 1f)
+            if (elapsed > WARMUP_MS && speed > 0f) samples.add(speed)
+            onProgress(speed, progress)
+            lastBytes = bytes; lastTime = now
+        }
 
-        val elapsed = (System.currentTimeMillis() - startTime) / 1000f
-        if (elapsed <= 0f) 0f else (bytesSent * 8f) / (elapsed * 1_000_000f)
+        running.set(false)
+        calls.forEach { it.cancel() }
+        jobs.awaitAll()
+
+        trimmedMean(samples)
+    }
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────
+    // Trim bottom 10% and top 10% outliers then return mean
+    private fun trimmedMean(samples: List<Float>): Float {
+        if (samples.isEmpty()) return 0f
+        val sorted = samples.sorted()
+        val lo = (sorted.size * 0.10).toInt()
+        val hi = (sorted.size * 0.90).toInt().coerceAtLeast(lo + 1)
+        val trimmed = if (hi <= sorted.size) sorted.subList(lo, hi) else sorted
+        return trimmed.average().toFloat()
     }
 }

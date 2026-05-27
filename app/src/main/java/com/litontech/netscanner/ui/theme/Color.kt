@@ -25,6 +25,10 @@ val GreenGlow       = Color(0x4000FF88)
 val NeonPurple      = Color(0xFFAA55FF)
 val PurpleGlow      = Color(0x40AA55FF)
 
+// Orange accent
+val NeonOrange      = Color(0xFFFF6B35)
+val OrangeGlow      = Color(0x40FF6B35)
+
 // Signal quality colors
 val SignalExcellent = Color(0xFF00FF88)
 val SignalGood      = Color(0xFF88FF00)
